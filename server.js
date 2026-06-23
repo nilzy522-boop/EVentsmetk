@@ -21,6 +21,10 @@
  *   POST /api/irc/send         { user, text }                                      -> { ok, id }
  *   POST /api/users/heartbeat  { user }                                            -> { ok, count, users }
  *   GET  /api/users/online                                                         -> { ok, count, users }
+ *   POST /api/configs/share    { owner, name, data }                               -> { ok, code }   (5/owner, 8-digit)
+ *   GET  /api/configs/get?code=XXXXXXXX                                            -> { ok, name, data, owner }
+ *   GET  /api/configs/list?owner=                                                  -> { ok, configs:[...] }
+ *   POST /api/configs/delete   { owner, code }                                     -> { ok }
  *
  * Run:   PORT=8080 node server.js
  * Health check:  GET /            -> { ok, markers, servers, parties }
@@ -28,6 +32,8 @@
 
 const http = require('http');
 const crypto = require('crypto');
+const path = require('path');
+const fs = require('fs');
 const funtime = require('./funtime');
 
 const PORT = parseInt(process.env.PORT || '8080', 10);
@@ -37,6 +43,167 @@ const INVITE_TTL_SECONDS = parseInt(process.env.INVITE_TTL || '120', 10);
 const MAX_MARKERS_PER_SERVER = parseInt(process.env.MAX_PER_SERVER || '256', 10);
 const MAX_MARKERS_PER_OWNER = parseInt(process.env.MAX_PER_OWNER || '5', 10); // one player keeps at most 5 markers
 const MAX_BODY_BYTES = 16 * 1024;
+
+// ------------------------------ cloud configs ----------------------------
+
+const CONFIG_CODE_DIGITS = parseInt(process.env.CONFIG_CODE_DIGITS || '8', 10); // 8-digit share codes
+const MAX_PUBLIC_CONFIGS_PER_OWNER = parseInt(process.env.MAX_CONFIGS_PER_OWNER || '5', 10);
+const CONFIG_UNUSED_TTL_MS = parseInt(process.env.CONFIG_UNUSED_DAYS || '30', 10) * 24 * 60 * 60 * 1000;
+const CONFIG_SWEEP_MS = parseInt(process.env.CONFIG_SWEEP_DAYS || '7', 10) * 24 * 60 * 60 * 1000; // weekly cleanup
+const MAX_CONFIG_BODY_BYTES = parseInt(process.env.MAX_CONFIG_BYTES || String(1024 * 1024), 10); // ~1MB config payloads
+const CONFIG_STORE_FILE = path.join(__dirname, 'configs-store.json');
+
+// code -> { code, owner, ownerLower, name, data, createdAt, lastAccessAt }
+const configs = new Map();
+let configSaveTimer = null;
+
+function loadConfigs() {
+   try {
+      if (!fs.existsSync(CONFIG_STORE_FILE)) {
+         return;
+      }
+      const raw = fs.readFileSync(CONFIG_STORE_FILE, 'utf8');
+      const arr = JSON.parse(raw);
+      if (Array.isArray(arr)) {
+         for (const entry of arr) {
+            if (entry && entry.code) {
+               configs.set(String(entry.code), entry);
+            }
+         }
+      }
+      console.log(`Loaded ${configs.size} cloud config(s) from disk`);
+   } catch (err) {
+      console.error('Could not load configs store:', err.message);
+   }
+}
+
+function persistConfigs() {
+   // Debounced write so a burst of shares/downloads doesn't hammer the disk.
+   if (configSaveTimer) {
+      return;
+   }
+   configSaveTimer = setTimeout(() => {
+      configSaveTimer = null;
+      try {
+         fs.writeFileSync(CONFIG_STORE_FILE, JSON.stringify([...configs.values()]), 'utf8');
+      } catch (err) {
+         console.error('Could not persist configs store:', err.message);
+      }
+   }, 500);
+   configSaveTimer.unref && configSaveTimer.unref();
+}
+
+function newConfigCode() {
+   const max = 10 ** CONFIG_CODE_DIGITS;
+   for (let attempt = 0; attempt < 50; attempt += 1) {
+      const n = crypto.randomInt(0, max);
+      const code = String(n).padStart(CONFIG_CODE_DIGITS, '0');
+      if (!configs.has(code)) {
+         return code;
+      }
+   }
+   return null;
+}
+
+function shareConfig(input) {
+   const owner = sanitizeString(input.owner, 32);
+   const name = sanitizeString(input.name, 48);
+   const data = typeof input.data === 'string' ? input.data : '';
+   if (!owner || !name || !data) {
+      return { error: 'missing fields' };
+   }
+   const ownerLower = nickKey(owner);
+
+   // Re-sharing a config of the same name from the same owner overwrites their existing entry
+   // (keeps its code) instead of consuming another slot.
+   let existing = null;
+   let ownerCount = 0;
+   for (const entry of configs.values()) {
+      if (entry.ownerLower === ownerLower) {
+         ownerCount += 1;
+         if (entry.name === name) {
+            existing = entry;
+         }
+      }
+   }
+
+   if (existing) {
+      existing.data = data;
+      existing.lastAccessAt = now();
+      persistConfigs();
+      return { code: existing.code };
+   }
+
+   if (ownerCount >= MAX_PUBLIC_CONFIGS_PER_OWNER) {
+      return { error: 'limit' };
+   }
+
+   const code = newConfigCode();
+   if (!code) {
+      return { error: 'code collision' };
+   }
+
+   const entry = { code, owner, ownerLower, name, data, createdAt: now(), lastAccessAt: now() };
+   configs.set(code, entry);
+   persistConfigs();
+   return { code };
+}
+
+function getConfig(codeRaw) {
+   const code = sanitizeString(codeRaw, 16);
+   if (!code) {
+      return { error: 'missing fields' };
+   }
+   const entry = configs.get(code);
+   if (!entry) {
+      return { error: 'not found' };
+   }
+   entry.lastAccessAt = now(); // a download keeps the config alive
+   persistConfigs();
+   return { name: entry.name, data: entry.data, owner: entry.owner };
+}
+
+function listConfigs(ownerRaw) {
+   const ownerLower = nickKey(sanitizeString(ownerRaw, 32));
+   const out = [];
+   for (const entry of configs.values()) {
+      if (entry.ownerLower === ownerLower) {
+         out.push({ code: entry.code, name: entry.name, createdAt: entry.createdAt, lastAccessAt: entry.lastAccessAt });
+      }
+   }
+   return out;
+}
+
+function deleteConfig(input) {
+   const ownerLower = nickKey(sanitizeString(input.owner, 32));
+   const code = sanitizeString(input.code, 16);
+   const entry = configs.get(code);
+   if (!entry || entry.ownerLower !== ownerLower) {
+      return false;
+   }
+   configs.delete(code);
+   persistConfigs();
+   return true;
+}
+
+function sweepConfigs() {
+   const t = now();
+   let removed = 0;
+   for (const [code, entry] of configs) {
+      if (t - (entry.lastAccessAt || entry.createdAt || 0) > CONFIG_UNUSED_TTL_MS) {
+         configs.delete(code);
+         removed += 1;
+      }
+   }
+   if (removed > 0) {
+      console.log(`Config cleanup: removed ${removed} config(s) unused for over 30 days`);
+      persistConfigs();
+   }
+}
+
+loadConfigs();
+sweepConfigs();
+setInterval(sweepConfigs, CONFIG_SWEEP_MS).unref();
 
 // ------------------------------ IRC + presence ---------------------------
 
@@ -233,13 +400,14 @@ function adminSecretOk(provided) {
    return crypto.timingSafeEqual(a, b);
 }
 
-function readBody(req) {
+function readBody(req, maxBytes) {
+   const limit = maxBytes || MAX_BODY_BYTES;
    return new Promise((resolve, reject) => {
       let size = 0;
       const chunks = [];
       req.on('data', (chunk) => {
          size += chunk.length;
-         if (size > MAX_BODY_BYTES) {
+         if (size > limit) {
             reject(new Error('body too large'));
             req.destroy();
             return;
@@ -623,6 +791,39 @@ const server = http.createServer(async (req, res) => {
 
       if (req.method === 'POST' && url.pathname === '/api/markers/delete') {
          const removed = deleteMarker(await readBody(req));
+         sendJson(res, 200, { ok: removed });
+         return;
+      }
+
+      // ---------------------------- cloud configs -----------------------------
+
+      if (req.method === 'POST' && url.pathname === '/api/configs/share') {
+         const result = shareConfig(await readBody(req, MAX_CONFIG_BODY_BYTES));
+         if (result.error) {
+            sendJson(res, result.error === 'limit' ? 409 : 400, { ok: false, error: result.error });
+            return;
+         }
+         sendJson(res, 200, { ok: true, code: result.code });
+         return;
+      }
+
+      if (req.method === 'GET' && url.pathname === '/api/configs/get') {
+         const result = getConfig(url.searchParams.get('code') || '');
+         if (result.error) {
+            sendJson(res, result.error === 'not found' ? 404 : 400, { ok: false, error: result.error });
+            return;
+         }
+         sendJson(res, 200, { ok: true, name: result.name, data: result.data, owner: result.owner });
+         return;
+      }
+
+      if (req.method === 'GET' && url.pathname === '/api/configs/list') {
+         sendJson(res, 200, { ok: true, configs: listConfigs(url.searchParams.get('owner') || '') });
+         return;
+      }
+
+      if (req.method === 'POST' && url.pathname === '/api/configs/delete') {
+         const removed = deleteConfig(await readBody(req));
          sendJson(res, 200, { ok: removed });
          return;
       }
